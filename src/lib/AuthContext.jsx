@@ -1,156 +1,164 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
-import { base44 } from '@/api/base44Client';
-import { appParams } from '@/lib/app-params';
-import { createAxiosClient } from '@base44/sdk/dist/utils/axios-client';
+import React, { createContext, useState, useContext, useEffect, useCallback } from 'react';
 
+// ─── Context ────────────────────────────────────────────────────────────────
 const AuthContext = createContext();
 
+// ─── Provider ────────────────────────────────────────────────────────────────
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
+  const [user, setUser]                   = useState(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [isLoadingAuth, setIsLoadingAuth] = useState(true);
-  const [isLoadingPublicSettings, setIsLoadingPublicSettings] = useState(true);
-  const [authError, setAuthError] = useState(null);
-  const [authChecked, setAuthChecked] = useState(false);
-  const [appPublicSettings, setAppPublicSettings] = useState(null); // Contains only { id, public_settings }
+  const [isLoadingAuth, setIsLoadingAuth] = useState(true);   // true on first load
+  const [authError, setAuthError]         = useState(null);
+  const [authChecked, setAuthChecked]     = useState(false);
 
-  useEffect(() => {
-    checkAppState();
+  // ── On mount: check if a valid session already exists ──────────────────────
+  // We keep a JWT token in localStorage. On page refresh we ask the backend
+  // "is this token still valid?" and get the user back.
+  const checkUserAuth = useCallback(async () => {
+    setIsLoadingAuth(true);
+    setAuthError(null);
+
+    const token = localStorage.getItem('dealert_token');
+
+    if (!token) {
+      // No token stored → definitely not logged in
+      setIsAuthenticated(false);
+      setUser(null);
+      setIsLoadingAuth(false);
+      setAuthChecked(true);
+      return;
+    }
+
+    try {
+      // Ask our own Next.js backend to verify the token
+      const res = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setUser(data.user);          // { id, username, email }
+        setIsAuthenticated(true);
+      } else {
+        // Token expired or invalid
+        localStorage.removeItem('dealert_token');
+        setUser(null);
+        setIsAuthenticated(false);
+
+        if (res.status === 401) {
+          setAuthError({ type: 'auth_required', message: 'Session expired. Please log in again.' });
+        }
+      }
+    } catch (err) {
+      console.error('Auth check failed:', err);
+      setAuthError({ type: 'unknown', message: 'Could not connect to server.' });
+      setIsAuthenticated(false);
+      setUser(null);
+    } finally {
+      setIsLoadingAuth(false);
+      setAuthChecked(true);
+    }
   }, []);
 
-  const checkAppState = async () => {
+  useEffect(() => {
+    checkUserAuth();
+  }, [checkUserAuth]);
+
+  // ── Register ───────────────────────────────────────────────────────────────
+  // Call this from your Register page.
+  // Returns { success: true } or { success: false, message: '...' }
+  const register = async ({ username, email, password }) => {
+    setAuthError(null);
     try {
-      setIsLoadingPublicSettings(true);
-      setAuthError(null);
-      
-      // First, check app public settings (with token if available)
-      // This will tell us if auth is required, user not registered, etc.
-      const appClient = createAxiosClient({
-        baseURL: `/api/apps/public`,
-        headers: {
-          'X-App-Id': appParams.appId
-        },
-        token: appParams.token, // Include token if available
-        interceptResponses: true
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, email, password }),
       });
-      
-      try {
-        const publicSettings = await appClient.get(`/prod/public-settings/by-id/${appParams.appId}`);
-        setAppPublicSettings(publicSettings);
-        
-        // If we got the app public settings successfully, check if user is authenticated
-        if (appParams.token) {
-          await checkUserAuth();
-        } else {
-          setIsLoadingAuth(false);
-          setIsAuthenticated(false);
-          setAuthChecked(true);
-        }
-        setIsLoadingPublicSettings(false);
-      } catch (appError) {
-        console.error('App state check failed:', appError);
-        
-        // Handle app-level errors
-        if (appError.status === 403 && appError.data?.extra_data?.reason) {
-          const reason = appError.data.extra_data.reason;
-          if (reason === 'auth_required') {
-            setAuthError({
-              type: 'auth_required',
-              message: 'Authentication required'
-            });
-          } else if (reason === 'user_not_registered') {
-            setAuthError({
-              type: 'user_not_registered',
-              message: 'User not registered for this app'
-            });
-          } else {
-            setAuthError({
-              type: reason,
-              message: appError.message
-            });
-          }
-        } else {
-          setAuthError({
-            type: 'unknown',
-            message: appError.message || 'Failed to load app'
-          });
-        }
-        setIsLoadingPublicSettings(false);
-        setIsLoadingAuth(false);
+
+      const data = await res.json();
+
+      if (res.ok) {
+        // Auto-login after successful registration
+        localStorage.setItem('dealert_token', data.token);
+        setUser(data.user);
+        setIsAuthenticated(true);
+        return { success: true };
+      } else {
+        return { success: false, message: data.message || 'Registration failed.' };
       }
-    } catch (error) {
-      console.error('Unexpected error:', error);
-      setAuthError({
-        type: 'unknown',
-        message: error.message || 'An unexpected error occurred'
-      });
-      setIsLoadingPublicSettings(false);
-      setIsLoadingAuth(false);
+    } catch (err) {
+      console.error('Register error:', err);
+      return { success: false, message: 'Could not connect to server.' };
     }
   };
 
-  const checkUserAuth = async () => {
+  // ── Login ──────────────────────────────────────────────────────────────────
+  // Accepts either username or email + password.
+  // Returns { success: true } or { success: false, message: '...' }
+  const login = async ({ usernameOrEmail, password }) => {
+    setAuthError(null);
     try {
-      // Now check if the user is authenticated
-      setIsLoadingAuth(true);
-      const currentUser = await base44.auth.me();
-      setUser(currentUser);
-      setIsAuthenticated(true);
-      setIsLoadingAuth(false);
-      setAuthChecked(true);
-    } catch (error) {
-      console.error('User auth check failed:', error);
-      setIsLoadingAuth(false);
-      setIsAuthenticated(false);
-      setAuthChecked(true);
-      
-      // If user auth fails, it might be an expired token
-      if (error.status === 401 || error.status === 403) {
-        setAuthError({
-          type: 'auth_required',
-          message: 'Authentication required'
-        });
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usernameOrEmail, password }),
+      });
+
+      const data = await res.json();
+
+      if (res.ok) {
+        localStorage.setItem('dealert_token', data.token);
+        setUser(data.user);
+        setIsAuthenticated(true);
+        return { success: true };
+      } else {
+        return { success: false, message: data.message || 'Invalid credentials.' };
       }
+    } catch (err) {
+      console.error('Login error:', err);
+      return { success: false, message: 'Could not connect to server.' };
     }
   };
 
-  const logout = (shouldRedirect = true) => {
+  // ── Logout ─────────────────────────────────────────────────────────────────
+  const logout = () => {
+    localStorage.removeItem('dealert_token');
     setUser(null);
     setIsAuthenticated(false);
-    
-    if (shouldRedirect) {
-      // Use the SDK's logout method which handles token cleanup and redirect
-      base44.auth.logout(window.location.href);
-    } else {
-      // Just remove the token without redirect
-      base44.auth.logout();
-    }
+    setAuthChecked(true);
+    setAuthError(null);
+    // In Next.js, redirect to login page like this:
+    window.location.href = '/login';
   };
 
-  const navigateToLogin = () => {
-    // Use the SDK's redirectToLogin method
-    base44.auth.redirectToLogin(window.location.href);
-  };
+  // ── Helper: get token for API calls ───────────────────────────────────────
+  // Use this in any component that needs to call a protected API:
+  //   const { getToken } = useAuth();
+  //   fetch('/api/alerts', { headers: { Authorization: `Bearer ${getToken()}` } })
+  const getToken = () => localStorage.getItem('dealert_token');
 
   return (
-    <AuthContext.Provider value={{ 
-      user, 
-      isAuthenticated, 
-      isLoadingAuth,
-      isLoadingPublicSettings,
-      authError,
-      appPublicSettings,
-      authChecked,
-      logout,
-      navigateToLogin,
-      checkUserAuth,
-      checkAppState
-    }}>
+    <AuthContext.Provider
+      value={{
+        user,                  // { id, username, email } or null
+        isAuthenticated,       // true / false
+        isLoadingAuth,         // true while checking session on first load
+        authError,             // { type, message } or null
+        authChecked,           // true once the first auth check is done
+        register,              // fn({ username, email, password })
+        login,                 // fn({ usernameOrEmail, password })
+        logout,                // fn()
+        getToken,              // fn() → token string
+        checkUserAuth,         // fn() — re-check session manually if needed
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
 };
 
+// ─── Hook ────────────────────────────────────────────────────────────────────
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) {
